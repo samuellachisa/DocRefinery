@@ -1,0 +1,44 @@
+triage:
+  # Character density thresholds in chars / PDF point^2
+  char_density:
+    native_digital_min: 0.002
+    scanned_max: 0.0003
+
+  # Image area ratio thresholds (0-1)
+  image_area_ratio:
+    scanned_min: 0.4
+    fast_text_max: 0.3
+
+  # Layout complexity thresholds
+  layout:
+    multi_column_min_xbands: 2
+    table_heavy_table_ratio: 0.2
+    figure_heavy_figure_ratio: 0.2
+
+  # Overall triage confidence scaling
+  confidence:
+    base: 0.7
+    bonus_clear_origin: 0.2
+    bonus_clear_layout: 0.1
+
+extraction:
+  fast_text:
+    min_page_coverage: 0.9
+    min_avg_confidence: 0.6
+  layout:
+    min_avg_confidence: 0.6
+
+vision:
+  # Approximate cost control for VLM extraction
+  max_cost_usd_per_document: 0.50
+  estimated_tokens_per_page: 1500
+  cost_per_1k_tokens_usd: 0.0015
+
+chunking:
+  # Approximate token budget for LDUs
+  max_tokens_per_chunk: 512
+  hard_max_tokens_per_chunk: 1024
+
+  # Whether to keep numbered lists as one LDU whenever possible
+  keep_numbered_lists_together: true
+
