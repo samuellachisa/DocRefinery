@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Optional
+import re
 
 from src.models import ExtractedDocument, Table
 from src.agents.query_agent import FactTable
@@ -25,13 +26,25 @@ class FactExtractor:
     def __init__(self, cfg: Optional[FactExtractorConfig] = None) -> None:
         self.cfg = cfg or FactExtractorConfig()
 
-    def _is_numeric(self, text: str) -> bool:
-        stripped = text.replace(",", "").replace(" ", "")
+    def _parse_numeric(self, text: str) -> Optional[float]:
+        """
+        Extract a numeric value from a cell.
+
+        Handles common patterns like:
+        - "950.00"
+        - "USD 950.00"
+        - "$950.00"
+        - "1,234.56"
+        """
+        # Find the first integer/float-like pattern in the string.
+        match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", text.replace("\u00a0", " "))
+        if not match:
+            return None
+        number_str = match.group(0).replace(",", "")
         try:
-            float(stripped)
-            return True
+            return float(number_str)
         except ValueError:
-            return False
+            return None
 
     def _extract_from_table(self, doc_id: str, tbl: Table, fact_table: FactTable) -> None:
         if not tbl.headers or not tbl.rows:
@@ -50,17 +63,14 @@ class FactExtractor:
                 value_text = cell.text.strip()
                 if not value_text:
                     continue
-                if not self._is_numeric(value_text):
+                parsed_value = self._parse_numeric(value_text)
+                if parsed_value is None:
                     continue
 
                 header = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
                 metric = header
                 period = header  # in many financial tables, header encodes period
-
-                try:
-                    value = float(value_text.replace(",", ""))
-                except ValueError:
-                    continue
+                value = parsed_value
 
                 fact_table.insert_fact(
                     doc_id=doc_id,

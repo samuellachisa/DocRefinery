@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
+from pathlib import Path
 from typing import List
+
+import yaml
 
 from src.models import BoundingBox, ExtractedDocument, LDU, ChunkType
 
@@ -30,6 +34,24 @@ class ChunkValidator:
             assert chunk.token_count >= 0
 
 
+@dataclass
+class ChunkingConfig:
+    max_tokens_per_chunk: int
+    hard_max_tokens_per_chunk: int
+    keep_numbered_lists_together: bool
+
+
+def load_chunking_config(config_path: Path) -> ChunkingConfig:
+    with config_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    cfg = data.get("chunking", {}) or {}
+    return ChunkingConfig(
+        max_tokens_per_chunk=int(cfg.get("max_tokens_per_chunk", 512)),
+        hard_max_tokens_per_chunk=int(cfg.get("hard_max_tokens_per_chunk", 1024)),
+        keep_numbered_lists_together=bool(cfg.get("keep_numbered_lists_together", True)),
+    )
+
+
 class ChunkingEngine:
     """
     Semantic Chunking Engine.
@@ -42,12 +64,46 @@ class ChunkingEngine:
     - Cross-references can be added later as relationships.
     """
 
-    def __init__(self, max_tokens_per_chunk: int = 512) -> None:
-        self.max_tokens_per_chunk = max_tokens_per_chunk
+    def __init__(self, rules_path: Path | None = None) -> None:
+        if rules_path is None:
+            rules_path = Path("rubric/extraction_rules.yaml")
+        cfg = load_chunking_config(rules_path)
+        self.max_tokens_per_chunk = cfg.max_tokens_per_chunk
+        self.hard_max_tokens_per_chunk = cfg.hard_max_tokens_per_chunk
+        self.keep_numbered_lists_together = cfg.keep_numbered_lists_together
         self.validator = ChunkValidator()
+
+    def _split_hard_max(self, text: str) -> List[str]:
+        """
+        Ensure that no resulting piece exceeds the hard_max_tokens_per_chunk.
+        Uses a simple recursive halving strategy based on approximate token count.
+        """
+        tokens = _approx_token_count(text)
+        if tokens <= self.hard_max_tokens_per_chunk:
+            return [text]
+
+        # Split on paragraph boundaries first, then fall back to character-level halving.
+        if "\n\n" in text:
+            parts = [p for p in text.split("\n\n") if p.strip()]
+            result: List[str] = []
+            for part in parts:
+                result.extend(self._split_hard_max(part))
+            return result
+
+        # Fallback: naive halving of the string until within budget.
+        mid = max(1, len(text) // 2)
+        left = text[:mid]
+        right = text[mid:]
+        result: List[str] = []
+        if left.strip():
+            result.extend(self._split_hard_max(left))
+        if right.strip():
+            result.extend(self._split_hard_max(right))
+        return result
 
     def chunk(self, doc: ExtractedDocument) -> List[LDU]:
         chunks: List[LDU] = []
+        seen_hashes: set[str] = set()
 
         # Paragraph-like chunks from text blocks, with list detection & cross-refs
         list_pattern = re.compile(r"^(\d+[\.\)]|[a-zA-Z][\.\)])\s+")
@@ -63,11 +119,20 @@ class ChunkingEngine:
             is_numbered_list = lines and all(list_pattern.match(ln.strip()) for ln in lines)
 
             if is_numbered_list:
-                # Keep whole list as a single LDU unless extremely long
                 tokens = _approx_token_count(text)
-                if tokens > self.max_tokens_per_chunk:
-                    # Fallback to paragraph splitting if list is too long
-                    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+                if (
+                    self.keep_numbered_lists_together
+                    and tokens <= self.hard_max_tokens_per_chunk
+                ):
+                    # Prefer to keep the whole list together when within hard budget.
+                    parts = [text]
+                    source_type = ChunkType.list
+                elif tokens > self.max_tokens_per_chunk:
+                    # Fallback to paragraph splitting if list is too long for normal chunks.
+                    raw_parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+                    parts = []
+                    for rp in raw_parts:
+                        parts.extend(self._split_hard_max(rp))
                     source_type = ChunkType.list
                 else:
                     parts = [text]
@@ -75,7 +140,10 @@ class ChunkingEngine:
             else:
                 tokens = _approx_token_count(text)
                 if tokens > self.max_tokens_per_chunk:
-                    parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+                    raw_parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+                    parts = []
+                    for rp in raw_parts:
+                        parts.extend(self._split_hard_max(rp))
                     source_type = ChunkType.paragraph
                 else:
                     parts = [text]
@@ -87,10 +155,13 @@ class ChunkingEngine:
                 ptokens = _approx_token_count(part)
                 page_refs = [tb.page_number]
                 content_hash = _hash_content(doc.doc_id, page_refs, part)
+                if content_hash in seen_hashes:
+                    continue
+                seen_hashes.add(content_hash)
                 refs = list({m.group(0) for m in xref_pattern.finditer(part)})
                 chunks.append(
                     LDU(
-                        id=content_hash[:16],
+                        id=content_hash,
                         doc_id=doc.doc_id,
                         chunk_type=source_type,
                         content=part,
@@ -118,9 +189,12 @@ class ChunkingEngine:
             page_refs = [tbl.page_number]
             bbox = tbl.bbox or BoundingBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
             content_hash = _hash_content(doc.doc_id, page_refs, content)
+            if content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
             chunks.append(
                 LDU(
-                    id=content_hash[:16],
+                    id=content_hash,
                     doc_id=doc.doc_id,
                     chunk_type=ChunkType.table,
                     content=content,
@@ -142,9 +216,12 @@ class ChunkingEngine:
             page_refs = [fig.page_number]
             bbox = fig.bbox or BoundingBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
             content_hash = _hash_content(doc.doc_id, page_refs, caption)
+            if content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
             chunks.append(
                 LDU(
-                    id=content_hash[:16],
+                    id=content_hash,
                     doc_id=doc.doc_id,
                     chunk_type=ChunkType.figure,
                     content=caption,

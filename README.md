@@ -4,18 +4,22 @@ This repository implements **The Document Intelligence Refinery** – a producti
 
 ### Features (High Level)
 
-- **Triage Agent (`src/agents/triage.py`)**: Profiles each document (origin type, layout complexity, language, domain hint, estimated extraction cost) and writes `DocumentProfile` JSON to `.refinery/profiles/`.
+- **Triage Agent (`src/agents/triage.py`)**: Profiles each document (origin type, layout complexity, language, domain hint, estimated extraction cost) using configurable thresholds and domain keywords from `rubric/extraction_rules.yaml`, then writes `DocumentProfile` JSON to `.refinery/profiles/`.
 - **Multi-Strategy Extraction (`src/agents/extractor.py`, `src/strategies/`)**:
   - Fast text extraction (pdfplumber) with confidence scoring.
   - Layout-aware extraction (Docling) for complex/table-heavy documents.
-  - Vision-augmented extraction (VLM via HTTP API) for scanned/low-confidence pages.
+  - Vision-augmented extraction (VLM via HTTP API) for scanned/low-confidence pages, with budget caps from config.
   - Escalation guard and extraction ledger in `.refinery/extraction_ledger.jsonl`.
-- **Semantic Chunking & PageIndex (Phase 3)**:
-  - Normalized `ExtractedDocument` model and `LDU` chunks.
+  - Cached `ExtractedDocument` JSON snapshots in `.refinery/extracted/` so downstream stages can be re-run without re-extracting.
+- **Semantic Chunking & PageIndex**:
+  - Normalized `ExtractedDocument` model and `LDU` chunks with stable `content_hash` identifiers.
+  - Config-driven chunking rules (token budgets, list handling) from `rubric/extraction_rules.yaml`.
   - PageIndex tree to navigate long documents before vector search.
-- **Query Agent (Phase 4)**:
+- **Query Agent & Storage**:
   - LangGraph-based agent with `pageindex_navigate`, `semantic_search`, and `structured_query` tools.
-  - Every answer includes a provenance chain (document, page, bbox, content_hash).
+  - Vector store (Chroma) for LDU embeddings in `.refinery/chroma/`.
+  - Structured `FactTable` for numeric facts in `.refinery/facts.sqlite`.
+  - Every answer includes a `ProvenanceChain` (document, page, bbox, content_hash).
 
 ### Project Layout
 
@@ -36,12 +40,18 @@ This repository implements **The Document Intelligence Refinery** – a producti
   - `fast_text.py` – pdfplumber-based extractor with confidence scoring.
   - `layout_docling.py` – Docling-based layout-aware extractor.
   - `vision_vlm.py` – VLM-based extractor with budget guard.
-- `rubric/extraction_rules.yaml` – Externalized thresholds and chunking rules.
+- `rubric/extraction_rules.yaml` – Externalized thresholds, domain keywords, and chunking rules.
 - `.refinery/` – Runtime artifacts:
   - `profiles/` – `DocumentProfile` JSON outputs.
+  - `extracted/` – cached `ExtractedDocument` JSON snapshots.
   - `pageindex/` – PageIndex JSON trees.
   - `extraction_ledger.jsonl` – extraction trace and cost estimates.
-- `tests/` – Unit tests for triage and extraction confidence scoring.
+  - `chroma/` – persisted vector store for LDUs.
+  - `facts.sqlite` – SQLite-backed fact table for numeric/financial facts.
+- `scripts/` – Utility entrypoints:
+  - `run_pipeline.py` – programmatic end-to-end pipeline runner.
+  - `vector_explorer.py` – CLI explorer for the vector store (LDUs).
+  - `chunk_from_extracted.py` – run chunking + ingest from cached extraction only.
 
 ### Setup
 
@@ -57,19 +67,26 @@ If you are not using editable installs:
 pip install .
 ```
 
-### Running Triage & Extraction (CLI sketch)
+### Quickstart – `run_pipeline.sh`
 
-Once implemented, a typical flow for a PDF at `data/sample.pdf` will look like:
+For most use cases, use the interactive shell wrapper:
 
 ```bash
-python -m src.agents.triage data/sample.pdf
-python -m src.agents.extractor data/sample.pdf
+./run_pipeline.sh
 ```
 
-Each command will:
+You will be prompted for:
 
-- Load configuration from `rubric/extraction_rules.yaml`.
-- Produce/update artifacts in `.refinery/`.
+- **PDF path** – for example `data/Annual_Report_JUNE-2017.pdf`.
+- **Optional question** – for full QA mode.
+- **Mode selection**:
+  - `1) Triage only` – run just the Triage Agent and emit a `DocumentProfile`.
+  - `2) Extraction` – run the multi-strategy extractor, update the extraction ledger, and cache an `ExtractedDocument` under `.refinery/extracted/`.
+  - `3) Full QA` – end-to-end pipeline (triage → extraction → chunking → PageIndex → QA) with optional LDU preview from the vector DB.
+  - `4) Chunk only` – build LDUs and ingest into the vector store from an existing cached extraction (no re-extraction).
+  - `5) Vector DB` – explore stored chunks (LDUs) via a small CLI explorer (summary, list docs, show doc, search, raw dump).
+
+All modes load configuration from `rubric/extraction_rules.yaml` and update artifacts in `.refinery/`.
 
 ### LLM Configuration via `.env`
 
@@ -96,21 +113,23 @@ LLM_VISION_MODEL=llama3.2-vision
 
 You can switch providers or models by editing `.env` without touching the code.
 
-### Full Pipeline Demo
+### Programmatic Full Pipeline Demo
 
-To run the **end-to-end pipeline** (Triage → Extraction → Chunking → PageIndex → Query with provenance) on a single PDF:
+You can also call the pipeline directly from Python (e.g., for integration tests or notebooks):
 
 ```bash
 python scripts/run_pipeline.py data/your_doc.pdf \
-  --question "What are the main findings of this report?"
+  --question "What are the main findings of this report?" \
+  --show-ldu-preview
 ```
 
 This will:
 
 - Print the `DocumentProfile`.
 - Run the multi-strategy extractor with escalation and log to `.refinery/extraction_ledger.jsonl`.
-- Build LDUs and a basic `PageIndex`.
+- Build LDUs and a basic `PageIndex`, ingest chunks into the vector store, and populate the `FactTable`.
 - Ask the query agent your question and output an answer plus a `ProvenanceChain` (document, page, bbox, content_hash, snippet).
+- Optionally preview a few stored LDUs as they appear in the vector DB.
 
 ### Notes
 

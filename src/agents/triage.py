@@ -30,9 +30,12 @@ class TriageConfig:
     scanned_min_image_ratio: float
     fast_text_max_image_ratio: float
     multi_column_min_xbands: int
+    table_heavy_table_ratio: float
+    figure_heavy_figure_ratio: float
     base_confidence: float
     bonus_clear_origin: float
     bonus_clear_layout: float
+    domain_keywords: Dict[str, List[str]]
 
 
 def load_triage_config(config_path: Path) -> TriageConfig:
@@ -40,6 +43,10 @@ def load_triage_config(config_path: Path) -> TriageConfig:
         data = yaml.safe_load(f)
 
     triage_cfg = data.get("triage", {})
+    layout_cfg = triage_cfg.get("layout", {})
+    confidence_cfg = triage_cfg.get("confidence", {})
+    domain_kw_cfg = triage_cfg.get("domain_keywords", {}) or {}
+
     return TriageConfig(
         native_digital_min_char_density=triage_cfg["char_density"][
             "native_digital_min"
@@ -47,10 +54,16 @@ def load_triage_config(config_path: Path) -> TriageConfig:
         scanned_max_char_density=triage_cfg["char_density"]["scanned_max"],
         scanned_min_image_ratio=triage_cfg["image_area_ratio"]["scanned_min"],
         fast_text_max_image_ratio=triage_cfg["image_area_ratio"]["fast_text_max"],
-        multi_column_min_xbands=triage_cfg["layout"]["multi_column_min_xbands"],
-        base_confidence=triage_cfg["confidence"]["base"],
-        bonus_clear_origin=triage_cfg["confidence"]["bonus_clear_origin"],
-        bonus_clear_layout=triage_cfg["confidence"]["bonus_clear_layout"],
+        multi_column_min_xbands=layout_cfg["multi_column_min_xbands"],
+        table_heavy_table_ratio=layout_cfg["table_heavy_table_ratio"],
+        figure_heavy_figure_ratio=layout_cfg["figure_heavy_figure_ratio"],
+        base_confidence=confidence_cfg["base"],
+        bonus_clear_origin=confidence_cfg["bonus_clear_origin"],
+        bonus_clear_layout=confidence_cfg["bonus_clear_layout"],
+        domain_keywords={
+            str(domain): list(keywords or [])
+            for domain, keywords in domain_kw_cfg.items()
+        },
     )
 
 
@@ -62,59 +75,79 @@ class DomainHintClassifier:
 
 
 class KeywordDomainHintClassifier(DomainHintClassifier):
-    """Very simple keyword-based classifier, easily swappable with a VLM-based one."""
+    """Keyword-based classifier driven by config, easily swappable with a VLM-based one."""
 
-    FINANCIAL_KEYWORDS = (
-        "balance sheet",
-        "income statement",
-        "statement of cash flows",
-        "revenue",
-        "profit",
-        "loss",
-        "equity",
-        "assets",
-        "liabilities",
-        "fiscal year",
-        "tax",
-    )
-    LEGAL_KEYWORDS = (
-        "hereinafter",
-        "plaintiff",
-        "defendant",
-        "court",
-        "decree",
-        "pursuant to",
-        "whereas",
-    )
-    TECHNICAL_KEYWORDS = (
-        "algorithm",
-        "architecture",
-        "throughput",
-        "latency",
-        "protocol",
-        "specification",
-        "implementation",
-    )
-    MEDICAL_KEYWORDS = (
-        "clinical",
-        "patient",
-        "diagnosis",
-        "treatment",
-        "therapy",
-        "symptom",
-        "disease",
-    )
+    def __init__(self, keywords_by_domain: Optional[Dict[DomainHint, List[str]]] = None):
+        if keywords_by_domain is None:
+            # Fallback to a small built-in set; in normal operation we expect
+            # keywords to be provided via TriageConfig.
+            keywords_by_domain = {
+                DomainHint.financial: [
+                    "balance sheet",
+                    "income statement",
+                    "statement of cash flows",
+                    "revenue",
+                    "profit",
+                    "loss",
+                    "equity",
+                    "assets",
+                    "liabilities",
+                    "fiscal year",
+                    "tax",
+                ],
+                DomainHint.legal: [
+                    "hereinafter",
+                    "plaintiff",
+                    "defendant",
+                    "court",
+                    "decree",
+                    "pursuant to",
+                    "whereas",
+                ],
+                DomainHint.technical: [
+                    "algorithm",
+                    "architecture",
+                    "throughput",
+                    "latency",
+                    "protocol",
+                    "specification",
+                    "implementation",
+                ],
+                DomainHint.medical: [
+                    "clinical",
+                    "patient",
+                    "diagnosis",
+                    "treatment",
+                    "therapy",
+                    "symptom",
+                    "disease",
+                ],
+            }
+        self.keywords_by_domain = {
+            domain: [kw.lower() for kw in keywords]
+            for domain, keywords in keywords_by_domain.items()
+        }
+
+    @classmethod
+    def from_config(cls, cfg: TriageConfig) -> "KeywordDomainHintClassifier":
+        mapping: Dict[DomainHint, List[str]] = {}
+        for key, keywords in cfg.domain_keywords.items():
+            try:
+                domain = DomainHint(key)
+            except ValueError:
+                # Ignore unknown domain hints so config can evolve safely.
+                continue
+            mapping[domain] = keywords
+        # If config didn't specify anything, we'll fall back to built-ins.
+        if not mapping:
+            return cls()
+        return cls(mapping)
 
     def classify(self, text_sample: str) -> DomainHint:
         lower = text_sample.lower()
-        if any(k in lower for k in self.FINANCIAL_KEYWORDS):
-            return DomainHint.financial
-        if any(k in lower for k in self.LEGAL_KEYWORDS):
-            return DomainHint.legal
-        if any(k in lower for k in self.TECHNICAL_KEYWORDS):
-            return DomainHint.technical
-        if any(k in lower for k in self.MEDICAL_KEYWORDS):
-            return DomainHint.medical
+        for domain, keywords in self.keywords_by_domain.items():
+            if any(k in lower for k in keywords):
+                return domain
         return DomainHint.general
 
 
@@ -219,13 +252,13 @@ def profile_document(
     rules_path: Path | None = None,
     domain_classifier: Optional[DomainHintClassifier] = None,
 ) -> DocumentProfile:
-    if domain_classifier is None:
-        domain_classifier = KeywordDomainHintClassifier()
-
     if rules_path is None:
         rules_path = Path("rubric/extraction_rules.yaml")
 
     cfg = load_triage_config(rules_path)
+
+    if domain_classifier is None:
+        domain_classifier = KeywordDomainHintClassifier.from_config(cfg)
 
     with pdfplumber.open(pdf_path) as pdf:
         page_stats = list(_iter_page_stats(pdf))
@@ -245,6 +278,19 @@ def profile_document(
         )
         avg_figure_count = (
             mean(p["figure_count"] for p in page_stats) if page_stats else 0.0
+        )
+
+        table_pages_with_content = sum(
+            1 for p in page_stats if p["table_count"] > 0.0
+        )
+        figure_pages_with_content = sum(
+            1 for p in page_stats if p["figure_count"] > 0.0
+        )
+        table_pages_ratio = (
+            table_pages_with_content / float(num_pages or 1)
+        )
+        figure_pages_ratio = (
+            figure_pages_with_content / float(num_pages or 1)
         )
 
         # Collect sample text from first few pages
@@ -276,10 +322,16 @@ def profile_document(
     with pdfplumber.open(pdf_path) as pdf2:
         layout_complexity = _estimate_layout_complexity(pdf2, cfg)
 
-    # refine layout complexity using table / figure density
-    if avg_table_count >= 1.0 and layout_complexity is not LayoutComplexity.multi_column:
+    # refine layout complexity using table / figure density ratios from config
+    if (
+        table_pages_ratio >= cfg.table_heavy_table_ratio
+        and layout_complexity is not LayoutComplexity.multi_column
+    ):
         layout_complexity = LayoutComplexity.table_heavy
-    elif avg_figure_count >= 1.0 and layout_complexity is not LayoutComplexity.multi_column:
+    elif (
+        figure_pages_ratio >= cfg.figure_heavy_figure_ratio
+        and layout_complexity is not LayoutComplexity.multi_column
+    ):
         layout_complexity = LayoutComplexity.figure_heavy
 
     clear_layout = layout_complexity is not LayoutComplexity.mixed
@@ -289,7 +341,20 @@ def profile_document(
     domain_hint = domain_classifier.classify(sample_text)
 
     # Estimated extraction cost
-    if origin_type is OriginType.native_digital and layout_complexity is LayoutComplexity.single_column:
+    # Special-case optimisation: simple native-digital financial docs (e.g. single-page invoices)
+    # can safely use fast text extraction even when a small table is present.
+    simple_financial_doc = (
+        origin_type is OriginType.native_digital
+        and layout_complexity in {LayoutComplexity.single_column, LayoutComplexity.table_heavy}
+        and domain_hint is DomainHint.financial
+        and num_pages <= 2
+        and avg_table_count <= 2.0
+        and avg_image_area_ratio <= cfg.fast_text_max_image_ratio
+    )
+
+    if simple_financial_doc:
+        estimated_cost = EstimatedExtractionCost.fast_text_sufficient
+    elif origin_type is OriginType.native_digital and layout_complexity is LayoutComplexity.single_column:
         estimated_cost = EstimatedExtractionCost.fast_text_sufficient
     elif origin_type is OriginType.scanned_image:
         estimated_cost = EstimatedExtractionCost.needs_vision_model
@@ -306,6 +371,11 @@ def profile_document(
         triage_confidence -= 0.1
     triage_confidence = max(0.0, min(1.0, triage_confidence))
 
+    # Empirical signals for OCR and table estimates
+    # Heuristic: if there is non-trivial text density, treat as having an OCR/text layer.
+    has_ocr_layer = avg_char_density > cfg.scanned_max_char_density
+    table_count_estimate = int(round(avg_table_count * num_pages))
+
     doc_id = _compute_doc_id(pdf_path)
 
     profile = DocumentProfile(
@@ -319,6 +389,8 @@ def profile_document(
         estimated_extraction_cost=estimated_cost,
         avg_char_density=avg_char_density,
         avg_image_area_ratio=avg_image_area_ratio,
+        has_ocr_layer=has_ocr_layer,
+        table_count_estimate=table_count_estimate,
         triage_confidence=triage_confidence,
         notes=f"avg_whitespace_ratio={avg_whitespace_ratio:.3f}, "
         f"avg_table_count={avg_table_count:.2f}, avg_figure_count={avg_figure_count:.2f}",

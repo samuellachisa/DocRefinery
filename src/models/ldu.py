@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .extracted_document import BoundingBox
 
@@ -15,6 +15,9 @@ class ChunkType(str, Enum):
     figure = "figure"
     list = "list"
     header = "header"
+    section_header = "section_header"
+    caption = "caption"
+    footnote = "footnote"
 
 
 class LDU(BaseModel):
@@ -46,4 +49,21 @@ class LDU(BaseModel):
         default_factory=list,
         description="Optional cross-references (e.g., 'Table 3', 'Figure 2.1').",
     )
+    relationships: List[Dict] = Field(
+        default_factory=list,
+        description="Optional relationship descriptors to other LDUs or entities.",
+    )
+    embedding: Optional[List[float]] = Field(
+        default=None,
+        description="Optional embedding vector; typically populated by the vector store.",
+    )
+
+    @field_validator("page_refs")
+    @classmethod
+    def _validate_page_refs(cls, v: List[int]) -> List[int]:  # type: ignore[override]
+        if not v:
+            raise ValueError("page_refs must contain at least one page number")
+        if any(p < 1 for p in v):
+            raise ValueError("page_refs must contain only positive page numbers (>= 1)")
+        return v
 

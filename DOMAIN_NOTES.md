@@ -1,6 +1,6 @@
 ## Domain Notes – Document Intelligence Refinery
 
-This file captures **Phase 0** domain onboarding notes: extraction strategy decision tree, observed failure modes, and a high-level pipeline diagram. It is meant to evolve as you test against the corpus.
+This file captures **Phase 0** domain onboarding notes: extraction strategy decision tree, observed failure modes, and a high-level pipeline diagram. It is meant to evolve as you test against the corpus and as you refine `rubric/extraction_rules.yaml` (thresholds, domain keywords, and chunking rules).
 
 ### Extraction Strategy Decision Tree (Initial Draft)
 

@@ -7,7 +7,7 @@ from typing import List, Tuple, Optional, TypedDict
 import chromadb
 from chromadb.utils import embedding_functions
 from langgraph.graph import StateGraph, END
-from sqlalchemy import Column, Float, Integer, MetaData, String, Table, create_engine
+from sqlalchemy import Column, Float, Integer, MetaData, String, Table, create_engine, func
 from sqlalchemy.engine import Engine
 from sqlalchemy.sql import select
 
@@ -98,11 +98,17 @@ class FactTable:
             )
 
     def query_metric(self, doc_id: str, metric: str) -> List[dict]:
+        """
+        Fuzzy metric lookup:
+        - Filters by doc_id.
+        - Matches rows where lower(metric) contains the provided metric substring.
+        """
+        metric_norm = metric.lower()
         with self.engine.begin() as conn:
             stmt = (
                 select(self.facts_table)
                 .where(self.facts_table.c.doc_id == doc_id)
-                .where(self.facts_table.c.metric == metric)
+                .where(func.lower(self.facts_table.c.metric).like(f"%{metric_norm}%"))
             )
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
@@ -235,7 +241,18 @@ def build_langgraph_agent(agent: QueryAgent):
 
         # Decide whether to use structured_query (for numeric/metric questions)
         lower_q = question.lower()
-        numeric_keywords = ("revenue", "income", "profit", "loss", "amount", "million", "billion", "$")
+        numeric_keywords = (
+            "revenue",
+            "income",
+            "profit",
+            "loss",
+            "amount",
+            "total",
+            "sum",
+            "million",
+            "billion",
+            "$",
+        )
         if any(k in lower_q for k in numeric_keywords):
             state["use_structured"] = True
         else:
@@ -243,22 +260,32 @@ def build_langgraph_agent(agent: QueryAgent):
 
         # Try structured_query first when appropriate
         if state["use_structured"]:
-            # Heuristic: look for metric keyword and query fact table
-            metric = next((k for k in numeric_keywords if k in lower_q), "revenue")
+            # Heuristic: look for metric keyword and query fact table.
+            # For invoices/financial reports, table headers often contain the metric name.
+            metric = next((k for k in numeric_keywords if k in lower_q), "amount")
             rows = agent.structured_query(agent.page_index.doc_id, metric)
             if rows:
-                best_row = rows[0]
+                total = sum(r.get("value", 0.0) for r in rows)
+                # Simple textual breakdown: first few rows as examples.
+                examples = []
+                for r in rows[:3]:
+                    examples.append(
+                        f"{r.get('entity')} – {r.get('metric')} {r.get('period')}: {r.get('value')}"
+                    )
+                breakdown = "; ".join(examples)
                 answer_txt = (
-                    f"{best_row['metric']} for {best_row['entity']} "
-                    f"in {best_row['period']}: {best_row['value']}"
+                    f"Total {metric} across {len(rows)} fact rows: {total}. "
+                    f"Examples: {breakdown}"
                 )
-                page_number = best_row.get("page_number", 1)
+                # Use the first row as primary provenance anchor.
+                first = rows[0]
+                page_number = first.get("page_number", 1)
                 span = ProvenanceSpan(
                     doc_name=doc_name,
                     doc_id=agent.page_index.doc_id,
                     page_number=page_number,
                     bbox=None,
-                    content_hash=best_row.get("content_hash") or None,
+                    content_hash=first.get("content_hash") or None,
                     snippet=answer_txt,
                 )
                 state["answer"] = answer_txt

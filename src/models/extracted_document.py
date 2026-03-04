@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class BoundingBox(BaseModel):
@@ -13,6 +13,22 @@ class BoundingBox(BaseModel):
     y0: float
     x1: float
     y1: float
+
+    @field_validator("x1")
+    @classmethod
+    def _validate_x(cls, v: float, info) -> float:  # type: ignore[override]
+        x0 = info.data.get("x0")
+        if x0 is not None and v < x0:
+            raise ValueError("x1 must be greater than or equal to x0")
+        return v
+
+    @field_validator("y1")
+    @classmethod
+    def _validate_y(cls, v: float, info) -> float:  # type: ignore[override]
+        y0 = info.data.get("y0")
+        if y0 is not None and v < y0:
+            raise ValueError("y1 must be greater than or equal to y0")
+        return v
 
 
 class TextBlock(BaseModel):

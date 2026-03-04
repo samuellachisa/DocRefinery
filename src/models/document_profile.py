@@ -4,7 +4,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class OriginType(str, Enum):
@@ -69,6 +69,18 @@ class DocumentProfile(BaseModel):
         description="Average fraction of page area occupied by images (0-1).",
     )
 
+    # Additional empirical signals expected by the rubric
+    has_ocr_layer: bool = Field(
+        ...,
+        description="Heuristic flag indicating presence of an OCR/text layer on most pages.",
+    )
+    table_count_estimate: int = Field(
+        ...,
+        ge=0,
+        description="Approximate number of tables detected across the document.",
+    )
+
+    # Triage-level confidence; kept for backward compatibility.
     triage_confidence: float = Field(
         ...,
         ge=0.0,
@@ -82,4 +94,22 @@ class DocumentProfile(BaseModel):
 
     class Config:
         frozen = True
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def confidence_score(self) -> float:
+        """Alias for rubric's confidence_score field."""
+        return self.triage_confidence
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def extraction_strategy_needed(
+        self,
+    ) -> Literal["fast_text", "layout_aware", "vision"]:
+        """Map internal EstimatedExtractionCost enum to rubric-friendly label."""
+        if self.estimated_extraction_cost is EstimatedExtractionCost.fast_text_sufficient:
+            return "fast_text"
+        if self.estimated_extraction_cost is EstimatedExtractionCost.needs_layout_model:
+            return "layout_aware"
+        return "vision"
 

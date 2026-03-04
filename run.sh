@@ -24,16 +24,26 @@ case "$CMD" in
   pipeline)
     PDF_PATH="${1:-}"
     QUESTION="${2:-What are the main findings of this report?}"
+    MODE="${3:-expert}"  # expert | simple
     if [[ -z "$PDF_PATH" ]]; then
-      echo "Usage: ./run.sh pipeline <pdf_path> [question]" >&2
+      echo "Usage: ./run.sh pipeline <pdf_path> [question] [mode]" >&2
+      echo "  mode: 'expert' (default) shows all steps; 'simple' shows only the final answer." >&2
       exit 1
     fi
-    uv run scripts/run_pipeline.py "$PDF_PATH" --question "$QUESTION"
+    if [[ "$MODE" == "simple" ]]; then
+      uv run python -m scripts.run_pipeline "$PDF_PATH" --question "$QUESTION" \
+        | awk '
+            /=== QA Result ===/ {show=1}
+            show {print}
+          '
+    else
+      uv run python -m scripts.run_pipeline "$PDF_PATH" --question "$QUESTION"
+    fi
     ;;
 
   batch)
     ROOT="${1:-data}"
-    uv run scripts/batch_process.py "$ROOT"
+    uv run python -m scripts.batch_process "$ROOT"
     ;;
 
   tests)
@@ -43,7 +53,8 @@ case "$CMD" in
   *)
     cat <<EOF
 Usage:
-  ./run.sh pipeline <pdf_path> [question]   # Run full pipeline on a single PDF
+  ./run.sh pipeline <pdf_path> [question] [mode]   # Run pipeline on a single PDF
+                                                 #   mode: expert (default) or simple
   ./run.sh batch [root_dir]                # Batch process all PDFs under root_dir (default: data/)
   ./run.sh tests                           # Run test suite
 EOF

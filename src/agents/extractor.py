@@ -158,10 +158,24 @@ def main() -> None:
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf_path).expanduser().resolve()
-    profile = profile_document(pdf_path, Path(args.rules).expanduser().resolve())
+    rules_path = Path(args.rules).expanduser().resolve()
+    profile = profile_document(pdf_path, rules_path)
 
-    router = ExtractionRouter(Path(args.rules))
+    router = ExtractionRouter(rules_path)
     result = router.route(profile)
+
+    # Persist the normalized ExtractedDocument so downstream steps (like chunking)
+    # can be run later without re-doing extraction.
+    extracted_dir = Path(".refinery/extracted")
+    extracted_dir.mkdir(parents=True, exist_ok=True)
+    extracted_path = extracted_dir / f"{profile.doc_id}.json"
+    with extracted_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            result.document.model_dump(mode="json"),
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
 
     # Print a brief summary for CLI usage
     print(
@@ -172,6 +186,7 @@ def main() -> None:
                 "num_text_blocks": len(result.document.text_blocks),
                 "num_tables": len(result.document.tables),
                 "num_figures": len(result.document.figures),
+                "extracted_path": str(extracted_path),
             },
             indent=2,
         )

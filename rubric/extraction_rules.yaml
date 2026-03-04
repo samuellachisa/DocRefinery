@@ -21,6 +21,47 @@ triage:
     bonus_clear_origin: 0.2
     bonus_clear_layout: 0.1
 
+  # Domain-specific keyword hints used by the triage DomainHint classifier.
+  # New domains can be onboarded by adding another key with a list of
+  # indicative phrases; values are matched case-insensitively.
+  domain_keywords:
+    financial:
+      - "balance sheet"
+      - "income statement"
+      - "statement of cash flows"
+      - "revenue"
+      - "profit"
+      - "loss"
+      - "equity"
+      - "assets"
+      - "liabilities"
+      - "fiscal year"
+      - "tax"
+    legal:
+      - "hereinafter"
+      - "plaintiff"
+      - "defendant"
+      - "court"
+      - "decree"
+      - "pursuant to"
+      - "whereas"
+    technical:
+      - "algorithm"
+      - "architecture"
+      - "throughput"
+      - "latency"
+      - "protocol"
+      - "specification"
+      - "implementation"
+    medical:
+      - "clinical"
+      - "patient"
+      - "diagnosis"
+      - "treatment"
+      - "therapy"
+      - "symptom"
+      - "disease"
+
 extraction:
   fast_text:
     min_page_coverage: 0.9
