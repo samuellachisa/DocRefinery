@@ -55,16 +55,25 @@ This repository implements **The Document Intelligence Refinery** – a producti
 
 ### Setup
 
+Using [uv](https://github.com/astral-sh/uv) (recommended):
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync --all-extras
 ```
 
-If you are not using editable installs:
+This creates a virtual environment, installs the project in editable mode, and includes dev dependencies (pytest, reportlab, etc.). Then run commands with:
 
 ```bash
-pip install .
+uv run pytest tests/ -v
+uv run python -m scripts.run_pipeline ...
+```
+
+Alternatively, with pip:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+pip install -e ".[dev]"
 ```
 
 ### Quickstart – `run_pipeline.sh`
