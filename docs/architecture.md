@@ -1,0 +1,156 @@
+# DocRefinery – 5-Stage Pipeline Architecture
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Client & Entrypoint"]
+        U["User / Upstream System"]
+        API["Refinery CLI / API"]
+        U --> API
+    end
+
+    subgraph ORCH["Pipeline Orchestrator"]
+        RUN["Pipeline Runner"]
+    end
+
+    API --> RUN
+
+    subgraph CFG["Configuration & Environment"]
+        CFGYAML["extraction_rules.yaml"]
+        ENV[".env LLM/VLM"]
+    end
+
+    RUN --> CFGYAML
+    RUN --> ENV
+
+    subgraph S1["Stage 1 – Ingestion & Triage"]
+        PRAW["Raw PDF"]
+        TRIAGE["TriageAgent"]
+        PROF["DocumentProfile"]
+        PRAW --> TRIAGE
+        TRIAGE --> PROF
+    end
+
+    RUN --> PRAW
+
+    subgraph S2["Stage 2 – Strategy Routing & Extraction"]
+        ROUTE["ExtractionRouter"]
+        LEDGER["Extraction Ledger"]
+        ASTRAT["Strategy A FastText"]
+        BSTRAT["Strategy B Layout"]
+        CSTRAT["Strategy C Vision"]
+        EDA["ExtractedDoc A"]
+        EDB["ExtractedDoc B"]
+        EDC["ExtractedDoc C"]
+        EDSEL["Best ExtractedDoc"]
+        ROUTE --> LEDGER
+        ROUTE -->|fast_text_sufficient| ASTRAT
+        ROUTE -->|needs_layout| BSTRAT
+        ROUTE -->|needs_vision| CSTRAT
+        ASTRAT --> EDA
+        BSTRAT --> EDB
+        CSTRAT --> EDC
+        EDA --> ROUTE
+        EDB --> ROUTE
+        EDC --> ROUTE
+        ROUTE --> EDSEL
+    end
+
+    PROF --> ROUTE
+
+    subgraph LLM["External Model Backends"]
+        TEXTLLM["Text LLM"]
+        VISIONLLM["Vision LLM"]
+    end
+
+    ASTRAT -.-> TEXTLLM
+    BSTRAT -.-> TEXTLLM
+    CSTRAT -.-> VISIONLLM
+    ENV --> TEXTLLM
+    ENV --> VISIONLLM
+
+    subgraph S3["Stage 3 – Normalization & Chunking"]
+        CHUNK["ChunkingAgent"]
+        LDUS["LDU List"]
+        CHUNK --> LDUS
+    end
+
+    EDSEL --> CHUNK
+
+    subgraph S4["Stage 4 – Indexing & Storage"]
+        PINDEX["PageIndex Builder"]
+        VECING["Embedding Writer"]
+        FACTEXT["FactTable Extractor"]
+        PJSON["PageIndex JSON"]
+        VSTORE["Vector Store"]
+        FACTDB["FactTable SQLite"]
+        PINDEX --> PJSON
+        VECING --> VSTORE
+        FACTEXT --> FACTDB
+    end
+
+    LDUS --> PINDEX
+    LDUS --> VECING
+    LDUS --> FACTEXT
+
+    subgraph S5["Stage 5 – Query & Answering"]
+        QIN["User Question"]
+        QAGENT["QueryAgent"]
+        TPI["pageindex_navigate"]
+        TVEC["semantic_search"]
+        TFACT["structured_query"]
+        QOUT["Answer + ProvenanceChain"]
+        QIN --> QAGENT
+        QAGENT --> TPI
+        QAGENT --> TVEC
+        QAGENT --> TFACT
+        TPI --> QAGENT
+        TVEC --> QAGENT
+        TFACT --> QAGENT
+        QAGENT --> QOUT
+    end
+
+    U --> QIN
+    QOUT --> U
+
+    PJSON --> TPI
+    VSTORE --> TVEC
+    FACTDB --> TFACT
+
+    subgraph OBS["Observability & Governance"]
+        METRICS["Metrics"]
+        CFGHIST["Config History"]
+    end
+
+    LEDGER --> METRICS
+    PROF --> METRICS
+    FACTDB --> METRICS
+    CFGYAML --> CFGHIST
+    ENV --> CFGHIST
+
+    classDef entryStyle fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef configStyle fill:#f5f5f5,stroke:#757575,stroke-width:2px
+    classDef s1Style fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    classDef s2Style fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
+    classDef llmStyle fill:#fff8e1,stroke:#f9a825,stroke-width:2px
+    classDef s3Style fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef s4Style fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    classDef s5Style fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    classDef obsStyle fill:#e0f7fa,stroke:#0097a7,stroke-width:2px
+
+    class U,API entryStyle
+    class CFGYAML,ENV configStyle
+    class PRAW,TRIAGE,PROF s1Style
+    class ROUTE,LEDGER,ASTRAT,BSTRAT,CSTRAT,EDA,EDB,EDC,EDSEL s2Style
+    class TEXTLLM,VISIONLLM llmStyle
+    class CHUNK,LDUS s3Style
+    class PINDEX,VECING,FACTEXT,PJSON,VSTORE,FACTDB s4Style
+    class QIN,QAGENT,TPI,TVEC,TFACT,QOUT s5Style
+    class METRICS,CFGHIST obsStyle
+```
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `architecture-diagram.mmd` | Standalone Mermaid source (copy into [Mermaid Live](https://mermaid.live) or other tools) |
+| `architecture-diagram.html` | Interactive HTML viewer with legend and zoom |
