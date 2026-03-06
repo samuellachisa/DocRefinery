@@ -17,11 +17,13 @@ def _approx_token_count(text: str) -> int:
 
 
 def _hash_content(doc_id: str, page_numbers: List[int], text: str) -> str:
-    h = hashlib.sha256()
-    h.update(doc_id.encode("utf-8"))
-    h.update(",".join(str(p) for p in sorted(page_numbers)).encode("utf-8"))
-    h.update(text.encode("utf-8"))
-    return h.hexdigest()
+    # NOTE: Temporarily disabled hashing to inspect exact content.
+    # h = hashlib.sha256()
+    # h.update(doc_id.encode("utf-8"))
+    # h.update(",".join(str(p) for p in sorted(page_numbers)).encode("utf-8"))
+    # h.update(text.encode("utf-8"))
+    # return h.hexdigest()
+    return text
 
 
 class ChunkValidator:

@@ -142,8 +142,8 @@ class ExtractionRouter:
 
 def main() -> None:
     import argparse
-
     from src.agents.triage import profile_document
+    from scripts.export_markdown import extracted_to_markdown
 
     parser = argparse.ArgumentParser(
         description="Extraction Router – multi-strategy extraction with escalation guard"
@@ -177,6 +177,17 @@ def main() -> None:
             ensure_ascii=False,
         )
 
+    # Additionally, emit a human-readable Markdown view (with embedded figure/chart images).
+    markdown_dir = Path(".refinery/markdown") / profile.doc_id
+    markdown_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = markdown_dir / "document.md"
+    markdown = extracted_to_markdown(
+        result.document,
+        pdf_path=Path(profile.source_path),
+        asset_dir=markdown_dir,
+    )
+    markdown_path.write_text(markdown, encoding="utf-8")
+
     # Print a brief summary for CLI usage
     print(
         json.dumps(
@@ -187,6 +198,7 @@ def main() -> None:
                 "num_tables": len(result.document.tables),
                 "num_figures": len(result.document.figures),
                 "extracted_path": str(extracted_path),
+                "markdown_path": str(markdown_path),
             },
             indent=2,
         )

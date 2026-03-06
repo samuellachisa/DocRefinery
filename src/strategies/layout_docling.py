@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List
 
+import pdfplumber
 from docling.document_converter import DocumentConverter
 
 from src.models import (
@@ -21,15 +22,39 @@ def _infer_page_number(item: object, fallback: int = 1) -> int:
     """
     Best-effort helper to infer a 1-based page number from a Docling item.
 
-    Docling's DocItem types typically expose some form of page index.
-    We defensively check several common attribute names and fall back
-    to 1 if nothing is available.
+    Docling's DocItem types typically expose page information via a provenance
+    object (e.g. `item.prov.page_no`, 1-based). We defensively check both the
+    item and any `prov` attribute, and fall back to 1 if nothing is available.
     """
-    for attr in ("page", "page_no", "page_num", "page_index", "page_idx"):
+    def _normalize(v: object) -> int | None:
+        if not isinstance(v, int):
+            return None
+        # Treat positive ints as already 1-based; 0 as a 0-based sentinel.
+        if v >= 1:
+            return v
+        if v == 0:
+            return 1
+        return None
+
+    # First, check direct attributes on the item.
+    for attr in ("page_no", "page", "page_num", "page_index", "page_idx"):
         value = getattr(item, attr, None)
-        if isinstance(value, int):
-            # Docling commonly uses 0-based indices; normalise to 1-based.
-            return value + 1 if value == 0 else value
+        norm = _normalize(value)
+        if norm is not None:
+            return norm
+
+    # Then, check a nested provenance object if present (Docling v2 pattern).
+    prov = getattr(item, "prov", None)
+    if prov is not None:
+        # Docling typically exposes prov as a list of ProvenanceItem.
+        prov_items = prov if isinstance(prov, (list, tuple)) else [prov]
+        for p in prov_items:
+            for attr in ("page_no", "page", "page_num", "page_index", "page_idx"):
+                value = getattr(p, attr, None)
+                norm = _normalize(value)
+                if norm is not None:
+                    return norm
+
     return fallback
 
 
@@ -162,6 +187,59 @@ class LayoutExtractor(ExtractionStrategy):
                 )
             )
             page_confidences[page_number] = max(page_confidences.get(page_number, 0.0), 0.5)
+
+        # Fallback: if Docling produced no usable table structure, try a pdfplumber pass.
+        if tables and all((not t.headers and not t.rows) for t in tables):
+            tables = []
+
+        if not tables:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_idx, page in enumerate(pdf.pages, start=1):
+                    try:
+                        raw_tables = page.extract_tables() or []
+                    except Exception:
+                        raw_tables = []
+
+                    for raw in raw_tables:
+                        if not raw:
+                            continue
+
+                        headers: List[str] = []
+                        rows_cells: List[List[TableCell]] = []
+
+                        if raw[0]:
+                            headers = [str(h) if h is not None else "" for h in raw[0]]
+                            data_rows = raw[1:]
+                        else:
+                            data_rows = raw
+
+                        for r_idx, row in enumerate(data_rows):
+                            cells_row: List[TableCell] = []
+                            for c_idx, cell_text in enumerate(row):
+                                text = str(cell_text) if cell_text is not None else ""
+                                cells_row.append(
+                                    TableCell(
+                                        row_index=r_idx,
+                                        col_index=c_idx,
+                                        text=text,
+                                        bbox=None,
+                                    )
+                                )
+                            rows_cells.append(cells_row)
+
+                        tables.append(
+                            Table(
+                                page_number=page_idx,
+                                bbox=None,
+                                headers=headers,
+                                rows=rows_cells,
+                                title=None,
+                                caption=None,
+                            )
+                        )
+                        page_confidences[page_idx] = max(
+                            page_confidences.get(page_idx, 0.0), 0.7
+                        )
 
         extracted = ExtractedDocument(
             doc_id=profile.doc_id,
