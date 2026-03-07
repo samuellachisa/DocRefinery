@@ -151,3 +151,86 @@ def test_chunker_loads_config_from_path(tmp_path: Path) -> None:
     assert engine.max_tokens_per_chunk == 256
     assert engine.hard_max_tokens_per_chunk == 512
     assert engine.keep_numbered_lists_together is False
+
+
+# ---------- Stress tests: noisy / real-world edge cases ----------
+
+
+def test_stress_very_long_table_single_ldu(rules_path: Path) -> None:
+    """
+    Very long table (many rows) remains a single LDU; table-header binding
+    is preserved; validator passes.
+    """
+    engine = ChunkingEngine(rules_path)
+    num_rows = 400
+    rows = [
+        [TableCell(row_index=i, col_index=0, text=f"Entity_{i}"), TableCell(row_index=i, col_index=1, text="100")]
+        for i in range(num_rows)
+    ]
+    doc = _make_extracted_doc(
+        text_blocks=[(1, "Preface.")],
+        tables=[
+            Table(
+                page_number=1,
+                headers=["Entity", "Revenue"],
+                rows=rows,
+            ),
+        ],
+    )
+    chunks = engine.chunk(doc)
+    table_chunks = [c for c in chunks if c.chunk_type == ChunkType.table]
+    assert len(table_chunks) == 1
+    assert "Entity_0" in table_chunks[0].content
+    assert "Entity_399" in table_chunks[0].content
+    assert table_chunks[0].content.count("\n") >= num_rows
+
+
+def test_stress_deeply_nested_list_kept_intact_when_under_hard_max(rules_path: Path) -> None:
+    """Long numbered list under hard_max_tokens is kept as a single LDU."""
+    engine = ChunkingEngine(rules_path)
+    lines = [f"{i+1}. Item number {i+1}." for i in range(120)]
+    doc = _make_extracted_doc(text_blocks=[(1, "\n".join(lines))])
+    chunks = engine.chunk(doc)
+    list_chunks = [c for c in chunks if c.chunk_type == ChunkType.list]
+    assert len(list_chunks) >= 1
+    assert "1. Item number 1." in list_chunks[0].content
+    assert list_chunks[0].token_count <= engine.hard_max_tokens_per_chunk
+
+
+def test_stress_long_list_splits_when_over_hard_max(rules_path: Path) -> None:
+    """Numbered list exceeding hard_max_tokens is split; each list chunk obeys hard_max."""
+    engine = ChunkingEngine(rules_path)
+    long_line = "1. " + "word " * 80
+    lines = [long_line.replace("1.", f"{i+1}.", 1) for i in range(40)]
+    doc = _make_extracted_doc(text_blocks=[(1, "\n".join(lines))])
+    chunks = engine.chunk(doc)
+    list_chunks = [c for c in chunks if c.chunk_type == ChunkType.list]
+    assert len(list_chunks) >= 1
+    for c in list_chunks:
+        assert c.token_count <= engine.hard_max_tokens_per_chunk
+
+
+def test_stress_ambiguous_cross_references_only_resolved_refs_in_relationships(rules_path: Path) -> None:
+    """
+    Text references 'Table 1' and 'Table 99'; document has only one table.
+    Only Table 1 is resolved; Table 99 is ambiguous and must not cause validation failure.
+    """
+    engine = ChunkingEngine(rules_path)
+    doc = _make_extracted_doc(
+        text_blocks=[
+            (1, "See Table 1 for the main data. Table 99 does not exist in this document."),
+        ],
+        tables=[
+            Table(
+                page_number=1,
+                headers=["A", "B"],
+                rows=[[TableCell(row_index=0, col_index=0, text="x"), TableCell(row_index=0, col_index=1, text="1")]],
+            ),
+        ],
+    )
+    chunks = engine.chunk(doc)
+    text_chunks = [c for c in chunks if "Table 1" in c.references and "Table 99" in c.references]
+    assert len(text_chunks) == 1
+    chunk = text_chunks[0]
+    assert len(chunk.relationships) == 1
+    assert chunk.relationships[0]["ref_text"] == "Table 1"

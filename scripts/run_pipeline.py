@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -12,6 +13,7 @@ from src.agents.query_agent import (
     VectorStore,
     FactTable,
     build_langgraph_agent,
+    invoke_structured,
 )
 from src.agents.fact_extractor import FactExtractor
 from src.agents.triage import profile_document
@@ -55,6 +57,7 @@ def run_pipeline(
     show_ldu_preview: bool = False,
     ldu_preview_max_chunks: int = 5,
     ldu_preview_max_chars: int = 400,
+    structured_output: bool = False,
 ) -> None:
     pdf_path = pdf_path.expanduser().resolve()
 
@@ -111,20 +114,29 @@ def run_pipeline(
         fact_table=fact_table,
     )
 
-    # Use LangGraph agent wrapper
-    graph = build_langgraph_agent(agent)
-    final_state = graph.invoke(
-        {"question": question, "doc_name": pdf_path.name},
-        config={"configurable": {"run_name": "docrefinery_query"}},
-    )
-    answer = final_state["answer"]
-    provenance = final_state["provenance"]
+    if structured_output:
+        result = invoke_structured(
+            agent,
+            question=question,
+            doc_name=pdf_path.name,
+            config={"configurable": {"run_name": "docrefinery_query"}},
+        )
+        print(json.dumps(result, indent=2))
+    else:
+        # Use LangGraph agent wrapper
+        graph = build_langgraph_agent(agent)
+        final_state = graph.invoke(
+            {"question": question, "doc_name": pdf_path.name},
+            config={"configurable": {"run_name": "docrefinery_query"}},
+        )
+        answer = final_state["answer"]
+        provenance = final_state["provenance"]
 
-    print("\n=== QA Result ===", flush=True)
-    print("Q:", question)
-    print("A:", answer)
-    print("\nProvenanceChain:", flush=True)
-    print(provenance.model_dump_json(indent=2))
+        print("\n=== QA Result ===", flush=True)
+        print("Q:", question)
+        print("A:", answer)
+        print("\nProvenanceChain:", flush=True)
+        print(provenance.model_dump_json(indent=2))
 
     if show_ldu_preview:
         _preview_ldus_from_vector_store(
@@ -168,6 +180,12 @@ def main() -> None:
         default=400,
         help="Maximum number of characters of content to display per chunk in the LDU preview.",
     )
+    parser.add_argument(
+        "--structured",
+        action="store_true",
+        help="Output a single JSON object (answer, provenance, tool_used, fallback_used, etc.) "
+        "for downstream system integration.",
+    )
     args = parser.parse_args()
 
     run_pipeline(
@@ -176,6 +194,7 @@ def main() -> None:
         show_ldu_preview=args.show_ldu_preview,
         ldu_preview_max_chunks=args.ldu_preview_max_chunks,
         ldu_preview_max_chars=args.ldu_preview_max_chars,
+        structured_output=args.structured,
     )
 
 

@@ -13,6 +13,9 @@ class ProvenanceSpan(BaseModel):
     doc_name: str
     doc_id: str
     page_number: int = Field(..., ge=1)
+    page_end: Optional[int] = Field(
+        None, ge=1, description="Last page when span covers multiple pages (inclusive)."
+    )
     bbox: Optional[BoundingBox] = None
     content_hash: Optional[str] = None
     snippet: Optional[str] = Field(
@@ -26,6 +29,8 @@ class ProvenanceSpan(BaseModel):
             raise ValueError(
                 "ProvenanceSpan without bbox must include a non-empty content_hash"
             )
+        if self.page_end is not None and self.page_end < self.page_number:
+            raise ValueError("page_end must be >= page_number when set")
         return self
 
 

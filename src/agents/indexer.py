@@ -24,8 +24,6 @@ def _detect_headings(text_blocks: List) -> List[Tuple[int, str, int]]:
         text = (getattr(tb, "text", None) or "").strip()
         if not text:
             continue
-        if not text:
-            continue
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         for line in lines:
             if len(line) > 120:
