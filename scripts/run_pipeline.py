@@ -5,7 +5,7 @@ from typing import Any, Dict, List
 
 from src.agents.chunker import ChunkingEngine
 from src.agents.extractor import ExtractionRouter
-from src.agents.indexer import PageIndexBuilder
+from src.agents.indexer import PageIndexBuilder, enrich_ldus_with_sections
 from src.agents.query_agent import (
     QueryAgent,
     VectorStoreConfig,
@@ -87,10 +87,11 @@ def run_pipeline(
     ldus = chunker.chunk(extracted)
     print(f"\n=== Chunking ===\nGenerated {len(ldus)} LDUs", flush=True)
 
-    # 4) PageIndex
+    # 4) PageIndex (with LDUs for data_types and section enrichment)
     print("\n[4/5] Building a table of contents and summaries...", flush=True)
     index_builder = PageIndexBuilder()
-    page_index = index_builder.build(extracted)
+    page_index = index_builder.build(extracted, ldus=ldus)
+    enrich_ldus_with_sections(ldus, page_index)
     print("\n=== PageIndex Root ===", flush=True)
     print(page_index.root.model_dump())
 

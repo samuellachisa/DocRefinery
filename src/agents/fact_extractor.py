@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import List, Optional
-import re
 
-from src.models import ExtractedDocument, Table
 from src.agents.query_agent import FactTable
+from src.models import ExtractedDocument, Table
+from src.utils.content_hash import content_hash
 
 
 @dataclass
@@ -46,13 +47,26 @@ class FactExtractor:
         except ValueError:
             return None
 
-    def _extract_from_table(self, doc_id: str, tbl: Table, fact_table: FactTable) -> None:
-        if not tbl.headers or not tbl.rows:
-            return
+    def _table_content_for_hash(self, tbl: Table) -> str:
+        """Build table content string in same format as chunker for stable content_hash."""
+        header_line = " | ".join(tbl.headers) if tbl.headers else ""
+        row_lines = [" | ".join(cell.text for cell in row) for row in tbl.rows]
+        return "\n".join([header_line] + row_lines if header_line else row_lines).strip()
 
-        headers = tbl.headers
-        # Assume first column is entity, remaining columns are metrics/periods.
-        for row in tbl.rows:
+    def _extract_from_table(self, doc_id: str, tbl: Table, fact_table: FactTable) -> None:
+        if not tbl.rows:
+            return
+        # When no headers, use first row as header for robust extraction (production-ready)
+        if tbl.headers:
+            headers = list(tbl.headers)
+            data_rows = tbl.rows
+        else:
+            headers = [cell.text.strip() or f"col_{j}" for j, cell in enumerate(tbl.rows[0])]
+            data_rows = tbl.rows[1:]
+
+        table_content = self._table_content_for_hash(tbl)
+        tbl_hash = content_hash(doc_id, [tbl.page_number], table_content)
+        for row in data_rows:
             if not row:
                 continue
             entity = row[0].text.strip()
@@ -79,7 +93,7 @@ class FactExtractor:
                     value=value,
                     period=str(period),
                     page_number=tbl.page_number,
-                    content_hash="",  # could be linked to LDU hash if needed
+                    content_hash=tbl_hash,
                 )
 
     def extract(self, doc: ExtractedDocument, fact_table: FactTable) -> None:

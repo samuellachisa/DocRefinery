@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional, TypedDict
+from typing import List, Literal, Tuple, Optional, TypedDict
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -11,7 +12,8 @@ from sqlalchemy import Column, Float, Integer, MetaData, String, Table, create_e
 from sqlalchemy.engine import Engine
 from sqlalchemy.sql import select
 
-from src.models import LDU, PageIndex, ProvenanceChain, ProvenanceSpan
+from src.llm import LLMConfig, call_text_llm
+from src.models import LDU, PageIndex, ProvenanceChain, ProvenanceSpan, SectionNode
 
 
 @dataclass
@@ -36,6 +38,7 @@ class VectorStore:
                 "page_refs": ldu.page_refs,
                 "chunk_type": ldu.chunk_type.value,
                 "content_hash": ldu.content_hash,
+                "parent_section": ldu.parent_section or "",
             }
             for ldu in ldus
         ]
@@ -140,9 +143,11 @@ class QueryAgent:
 
     # --- tools ---
 
-    def pageindex_navigate(self, topic: str) -> List[PageIndex]:
-        # Current simple implementation: always return the stored PageIndex
-        return [self.page_index]
+    def pageindex_navigate(self, topic: str, top_k: int = 5) -> List[SectionNode]:
+        """Navigate the PageIndex by topic; returns the top_k section nodes most relevant to the topic."""
+        from src.agents.indexer import navigate_pageindex
+
+        return navigate_pageindex(self.page_index, topic, top_k=top_k)
 
     def semantic_search(self, query: str, k: int = 5) -> List[LDU]:
         matches = self.vector_store.query(query, k=k)
@@ -187,31 +192,34 @@ class QueryAgent:
 
     def audit_claim(self, claim: str, doc_name: str) -> tuple[str, ProvenanceChain, bool]:
         """
-        Audit mode:
-        - Attempts to find support for a claim via semantic_search.
-        - If a relevant chunk is found, returns it with provenance and verified=True.
-        - Otherwise returns unverifiable.
+        Audit mode: multi-source verification. Retrieves multiple candidate chunks;
+        if at least one provides support, returns verified=True with full provenance.
+        Otherwise explicitly flags as unverifiable with clear message.
         """
-        matches = self.semantic_search(claim, k=1)
+        matches = self.semantic_search(claim, k=5)
         if not matches:
             return (
-                "Claim not found or unverifiable based on available chunks.",
+                "Claim could not be verified: no supporting content found in the document. Flagged as unverifiable.",
                 ProvenanceChain(spans=[]),
                 False,
             )
-
-        best = matches[0]
-        page_number = best.page_refs[0] if best.page_refs else 1
-        span = ProvenanceSpan(
-            doc_name=doc_name,
-            doc_id=best.doc_id,
-            page_number=page_number,
-            bbox=best.bounding_box,
-            content_hash=best.content_hash,
-            snippet=best.content[:300],
-        )
-        chain = ProvenanceChain(spans=[span])
-        return best.content, chain, True
+        # Build provenance from all supporting chunks (multi-source)
+        spans: List[ProvenanceSpan] = []
+        for best in matches:
+            page_number = best.page_refs[0] if best.page_refs else 1
+            spans.append(
+                ProvenanceSpan(
+                    doc_name=doc_name,
+                    doc_id=best.doc_id,
+                    page_number=page_number,
+                    bbox=best.bounding_box,
+                    content_hash=best.content_hash,
+                    snippet=best.content[:300],
+                )
+            )
+        chain = ProvenanceChain(spans=spans)
+        supporting = "\n\n".join(m.content[:500] for m in matches[:3])
+        return supporting, chain, True
 
 
 class AgentState(TypedDict, total=False):
@@ -222,118 +230,152 @@ class AgentState(TypedDict, total=False):
     answer: str
     provenance: ProvenanceChain
     use_structured: bool
+    chosen_tool: str
+
+
+def _llm_choose_tool(question: str, llm_cfg: LLMConfig) -> Literal["semantic_search", "structured_query", "pageindex_navigate"]:
+    """Dynamic tool selection: LLM picks the best tool for the question."""
+    prompt = (
+        "You must choose exactly one tool to answer this question.\n"
+        "Tools:\n"
+        "- pageindex_navigate: for document structure, table of contents, which section or page contains a topic.\n"
+        "- semantic_search: for factual content, definitions, explanations, general content.\n"
+        "- structured_query: for numbers, metrics, revenue, totals, amounts, financial data.\n\n"
+        "Question: " + question + "\n\n"
+        "Reply with only one word: pageindex_navigate, semantic_search, or structured_query."
+    )
+    try:
+        raw = call_text_llm(prompt, llm_cfg).strip().lower()
+        if "pageindex" in raw or "navigate" in raw:
+            return "pageindex_navigate"
+        if "structured" in raw or "query" in raw:
+            return "structured_query"
+        return "semantic_search"
+    except Exception:
+        lower = question.lower()
+        if any(k in lower for k in ("revenue", "income", "profit", "amount", "total", "million", "billion", "$")):
+            return "structured_query"
+        if any(k in lower for k in ("section", "page", "where", "structure", "contents", "toc")):
+            return "pageindex_navigate"
+        return "semantic_search"
 
 
 def build_langgraph_agent(agent: QueryAgent):
     """
-    Build a minimal LangGraph agent that uses three conceptual tools:
-    - pageindex_navigate (via agent.pageindex_navigate)
-    - semantic_search (via agent.semantic_search)
-    - structured_query (via agent.structured_query)
-
-    For now, orchestration is simple: we prioritise semantic search and fall
-    back to PageIndex, but the structure is ready for richer routing.
+    LangGraph agent with dynamic LLM-based tool selection. Every answer
+    has full provenance (doc_name, page_number, bbox, content_hash).
     """
+
+    llm_cfg = LLMConfig.from_env()
+
+    def router_node(state: AgentState) -> AgentState:
+        state["chosen_tool"] = _llm_choose_tool(state["question"], llm_cfg)
+        return state
 
     def answer_node(state: AgentState) -> AgentState:
         question = state["question"]
         doc_name = state.get("doc_name", "document")
-
-        # Decide whether to use structured_query (for numeric/metric questions)
+        chosen = state.get("chosen_tool") or "semantic_search"
         lower_q = question.lower()
-        numeric_keywords = (
-            "revenue",
-            "income",
-            "profit",
-            "loss",
-            "amount",
-            "total",
-            "sum",
-            "million",
-            "billion",
-            "$",
-        )
-        if any(k in lower_q for k in numeric_keywords):
-            state["use_structured"] = True
-        else:
-            state["use_structured"] = False
 
-        # Try structured_query first when appropriate
-        if state["use_structured"]:
-            # Heuristic: look for metric keyword and query fact table.
-            # For invoices/financial reports, table headers often contain the metric name.
-            metric = next((k for k in numeric_keywords if k in lower_q), "amount")
+        def set_structured(rows: list, answer_txt: str) -> None:
+            first = rows[0]
+            page_number = first.get("page_number", 1)
+            fact_hash = first.get("content_hash") or hashlib.sha256(
+                f"{first.get('entity')}:{first.get('metric')}:{page_number}".encode()
+            ).hexdigest()[:32]
+            state["answer"] = answer_txt
+            state["provenance"] = ProvenanceChain(spans=[ProvenanceSpan(
+                doc_name=doc_name,
+                doc_id=agent.page_index.doc_id,
+                page_number=page_number,
+                bbox=None,
+                content_hash=fact_hash,
+                snippet=answer_txt,
+            )])
+
+        # Try chosen tool first
+        if chosen == "structured_query":
+            metric = next(
+                (k for k in ("revenue", "income", "profit", "amount", "total", "sum", "million", "billion") if k in lower_q),
+                "amount",
+            )
             rows = agent.structured_query(agent.page_index.doc_id, metric)
             if rows:
                 total = sum(r.get("value", 0.0) for r in rows)
-                # Simple textual breakdown: first few rows as examples.
-                examples = []
-                for r in rows[:3]:
-                    examples.append(
-                        f"{r.get('entity')} – {r.get('metric')} {r.get('period')}: {r.get('value')}"
-                    )
-                breakdown = "; ".join(examples)
-                answer_txt = (
-                    f"Total {metric} across {len(rows)} fact rows: {total}. "
-                    f"Examples: {breakdown}"
-                )
-                # Use the first row as primary provenance anchor.
-                first = rows[0]
-                page_number = first.get("page_number", 1)
-                span = ProvenanceSpan(
+                examples = [f"{r.get('entity')} – {r.get('metric')} {r.get('period')}: {r.get('value')}" for r in rows[:3]]
+                set_structured(rows, f"Total {metric} across {len(rows)} fact rows: {total}. Examples: {'; '.join(examples)}")
+                return state
+        elif chosen == "pageindex_navigate":
+            sections = agent.pageindex_navigate(question, top_k=1)
+            if sections:
+                sec = sections[0]
+                summary_text = sec.summary or ""
+                section_hash = hashlib.sha256(summary_text.encode()).hexdigest()[:32] if summary_text else "pageindex"
+                state["answer"] = sec.summary or "Relevant section found in PageIndex."
+                state["provenance"] = ProvenanceChain(spans=[ProvenanceSpan(
                     doc_name=doc_name,
                     doc_id=agent.page_index.doc_id,
-                    page_number=page_number,
+                    page_number=sec.page_start,
                     bbox=None,
-                    content_hash=first.get("content_hash") or None,
-                    snippet=answer_txt,
-                )
-                state["answer"] = answer_txt
-                state["provenance"] = ProvenanceChain(spans=[span])
+                    content_hash=section_hash,
+                    snippet=summary_text or "",
+                )])
+                return state
+        else:
+            matches = agent.semantic_search(question, k=1)
+            if matches:
+                best = matches[0]
+                page_number = best.page_refs[0] if best.page_refs else 1
+                state["answer"] = best.content
+                state["provenance"] = ProvenanceChain(spans=[ProvenanceSpan(
+                    doc_name=doc_name,
+                    doc_id=best.doc_id,
+                    page_number=page_number,
+                    bbox=best.bounding_box,
+                    content_hash=best.content_hash,
+                    snippet=best.content[:300],
+                )])
                 return state
 
-        # Use semantic_search as primary tool otherwise
-        matches = agent.semantic_search(question, k=1)
-        if matches:
-            best = matches[0]
-            page_number = best.page_refs[0] if best.page_refs else 1
-            span = ProvenanceSpan(
-                doc_name=doc_name,
-                doc_id=best.doc_id,
-                page_number=page_number,
-                bbox=best.bounding_box,
-                content_hash=best.content_hash,
-                snippet=best.content[:300],
-            )
-            state["answer"] = best.content
-            state["provenance"] = ProvenanceChain(spans=[span])
-            return state
-
-        # Fallback: use PageIndex navigation(query) to at least constrain the section
-        from src.agents.indexer import navigate_pageindex  # local import to avoid cycle
-
-        sections = navigate_pageindex(agent.page_index, question, top_k=1)
-        if sections:
-            sec = sections[0]
-            span = ProvenanceSpan(
-                doc_name=doc_name,
-                doc_id=agent.page_index.doc_id,
-                page_number=sec.page_start,
-                bbox=None,
-                content_hash=None,
-                snippet=sec.summary or "",
-            )
-            state["answer"] = sec.summary or "Relevant section found in PageIndex."
-            state["provenance"] = ProvenanceChain(spans=[span])
-            return state
+        # Fallback: try other tools
+        if chosen != "structured_query":
+            rows = agent.structured_query(agent.page_index.doc_id, "amount")
+            if rows:
+                total = sum(r.get("value", 0.0) for r in rows)
+                set_structured(rows, f"Found numerical data: total across {len(rows)} rows: {total}.")
+                return state
+        if chosen != "semantic_search":
+            matches = agent.semantic_search(question, k=1)
+            if matches:
+                best = matches[0]
+                page_number = best.page_refs[0] if best.page_refs else 1
+                state["answer"] = best.content
+                state["provenance"] = ProvenanceChain(spans=[ProvenanceSpan(
+                    doc_name=doc_name, doc_id=best.doc_id, page_number=page_number,
+                    bbox=best.bounding_box, content_hash=best.content_hash, snippet=best.content[:300],
+                )])
+                return state
+        if chosen != "pageindex_navigate":
+            sections = agent.pageindex_navigate(question, top_k=1)
+            if sections:
+                sec = sections[0]
+                state["answer"] = sec.summary or "Relevant section found in PageIndex."
+                state["provenance"] = ProvenanceChain(spans=[ProvenanceSpan(
+                    doc_name=doc_name, doc_id=agent.page_index.doc_id, page_number=sec.page_start,
+                    bbox=None, content_hash=hashlib.sha256((sec.summary or "").encode()).hexdigest()[:32], snippet=sec.summary or "",
+                )])
+                return state
 
         state["answer"] = "No relevant information found."
         state["provenance"] = ProvenanceChain(spans=[])
         return state
 
     graph = StateGraph(AgentState)
+    graph.add_node("router", router_node)
     graph.add_node("answer", answer_node)
-    graph.set_entry_point("answer")
+    graph.set_entry_point("router")
+    graph.add_edge("router", "answer")
     graph.add_edge("answer", END)
     return graph.compile()
 

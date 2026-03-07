@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.agents.chunker import ChunkingEngine, ChunkValidator
+from src.agents.chunker import ChunkingEngine, ChunkValidator, ChunkValidationError
 from src.models import BoundingBox, ExtractedDocument, LDU, Table, TableCell, TextBlock
 from src.models import ChunkType
 
@@ -134,7 +134,7 @@ def test_chunk_validator_rejects_empty_content() -> None:
         token_count=0,
         content_hash="y",
     )
-    with pytest.raises(AssertionError, match="Chunk content must not be empty"):
+    with pytest.raises(ChunkValidationError, match="Chunk content must not be empty"):
         validator.validate([invalid_ldu])
 
 

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import yaml
 
 from src.models import BoundingBox, ExtractedDocument, LDU, ChunkType
+from src.utils.content_hash import content_hash
+
+
+class ChunkValidationError(Exception):
+    """Raised when ChunkValidator finds a violation of the five chunking rules."""
+
+    def __init__(self, message: str, chunk_id: str = "") -> None:
+        self.chunk_id = chunk_id
+        super().__init__(message)
 
 
 def _approx_token_count(text: str) -> int:
@@ -16,24 +24,66 @@ def _approx_token_count(text: str) -> int:
     return max(0, int(len(text) / 4))
 
 
-def _hash_content(doc_id: str, page_numbers: List[int], text: str) -> str:
-    # NOTE: Temporarily disabled hashing to inspect exact content.
-    # h = hashlib.sha256()
-    # h.update(doc_id.encode("utf-8"))
-    # h.update(",".join(str(p) for p in sorted(page_numbers)).encode("utf-8"))
-    # h.update(text.encode("utf-8"))
-    # return h.hexdigest()
-    return text
-
-
 class ChunkValidator:
-    """Verifies that core chunking rules are not violated."""
+    """
+    Verifies that the five core chunking rules are not violated:
+    1. Table-header binding: table LDUs contain header + rows (never split).
+    2. Figure captions: figure LDUs have non-empty caption content.
+    3. Numbered lists: list LDUs do not exceed hard_max_tokens (kept intact when possible).
+    4. Section header propagation: parent_section may be set (optional at chunk time).
+    5. Cross-references: references that match known tables/figures have resolved relationships.
+    """
+
+    def __init__(self, hard_max_tokens_per_chunk: int = 1024) -> None:
+        self.hard_max_tokens_per_chunk = hard_max_tokens_per_chunk
 
     def validate(self, chunks: List[LDU]) -> None:
-        # For this initial implementation, we only perform basic sanity checks.
+        table_ids = [c.id for c in chunks if c.chunk_type == ChunkType.table]
+        figure_ids = [c.id for c in chunks if c.chunk_type == ChunkType.figure]
+        ref_to_id: Dict[str, str] = {}
+        for i, ldu_id in enumerate(table_ids, start=1):
+            ref_to_id[f"Table {i}"] = ldu_id
+            ref_to_id[f"table {i}"] = ldu_id
+        for i, ldu_id in enumerate(figure_ids, start=1):
+            ref_to_id[f"Figure {i}"] = ldu_id
+            ref_to_id[f"figure {i}"] = ldu_id
+
         for chunk in chunks:
-            assert chunk.content, "Chunk content must not be empty"
-            assert chunk.token_count >= 0
+            if not chunk.content:
+                raise ChunkValidationError("Chunk content must not be empty", chunk.id)
+            if chunk.token_count < 0:
+                raise ChunkValidationError("Chunk token_count must be non-negative", chunk.id)
+            if chunk.chunk_type == ChunkType.table:
+                if "\n" not in chunk.content and "|" not in chunk.content:
+                    raise ChunkValidationError(
+                        "Table LDU must contain header and/or rows (table-header binding).",
+                        chunk.id,
+                    )
+            if chunk.chunk_type == ChunkType.figure:
+                if not chunk.content.strip():
+                    raise ChunkValidationError(
+                        "Figure LDU must have non-empty caption content.",
+                        chunk.id,
+                    )
+            if chunk.chunk_type == ChunkType.list:
+                if chunk.token_count > self.hard_max_tokens_per_chunk:
+                    raise ChunkValidationError(
+                        "List LDU must not exceed hard_max_tokens (numbered lists kept intact).",
+                        chunk.id,
+                    )
+            for ref in chunk.references:
+                ref_key = ref.strip()
+                if ref_key in ref_to_id:
+                    target_id = ref_to_id[ref_key]
+                    resolved = [
+                        r for r in (chunk.relationships or [])
+                        if r.get("target_ldu_id") == target_id
+                    ]
+                    if not resolved:
+                        raise ChunkValidationError(
+                            f"Cross-reference '{ref}' should resolve to LDU id {target_id}.",
+                            chunk.id,
+                        )
 
 
 @dataclass
@@ -41,6 +91,44 @@ class ChunkingConfig:
     max_tokens_per_chunk: int
     hard_max_tokens_per_chunk: int
     keep_numbered_lists_together: bool
+
+
+def _resolve_cross_references(chunks: List[LDU]) -> None:
+    """Resolve reference strings (e.g. 'Table 3', 'Figure 2') to target LDU ids."""
+    table_ids = [c.id for c in chunks if c.chunk_type == ChunkType.table]
+    figure_ids = [c.id for c in chunks if c.chunk_type == ChunkType.figure]
+    ref_to_id: Dict[str, str] = {}
+    for i, ldu_id in enumerate(table_ids, start=1):
+        ref_to_id["Table %d" % i] = ldu_id
+        ref_to_id["table %d" % i] = ldu_id
+    for i, ldu_id in enumerate(figure_ids, start=1):
+        ref_to_id["Figure %d" % i] = ldu_id
+        ref_to_id["figure %d" % i] = ldu_id
+
+    for chunk in chunks:
+        if not chunk.references:
+            continue
+        resolved: List[Dict] = []
+        for ref in chunk.references:
+            key = ref.strip()
+            if key in ref_to_id:
+                resolved.append({
+                    "target_ldu_id": ref_to_id[key],
+                    "ref_text": ref,
+                })
+            else:
+                # Try normalized form (e.g. "Figure 2.1" -> "Figure 2")
+                m = re.match(r"(?i)(Table|Figure)\s+(\d+)", key)
+                if m:
+                    prefix, num = m.group(1), m.group(2)
+                    canonical = f"{prefix.capitalize()} {num}"
+                    if canonical in ref_to_id:
+                        resolved.append({
+                            "target_ldu_id": ref_to_id[canonical],
+                            "ref_text": ref,
+                        })
+        if resolved:
+            chunk.relationships = resolved
 
 
 def load_chunking_config(config_path: Path) -> ChunkingConfig:
@@ -73,7 +161,9 @@ class ChunkingEngine:
         self.max_tokens_per_chunk = cfg.max_tokens_per_chunk
         self.hard_max_tokens_per_chunk = cfg.hard_max_tokens_per_chunk
         self.keep_numbered_lists_together = cfg.keep_numbered_lists_together
-        self.validator = ChunkValidator()
+        self.validator = ChunkValidator(
+            hard_max_tokens_per_chunk=self.hard_max_tokens_per_chunk,
+        )
 
     def _split_hard_max(self, text: str) -> List[str]:
         """
@@ -156,14 +246,14 @@ class ChunkingEngine:
                     continue
                 ptokens = _approx_token_count(part)
                 page_refs = [tb.page_number]
-                content_hash = _hash_content(doc.doc_id, page_refs, part)
-                if content_hash in seen_hashes:
+                content_hash_val = content_hash(doc.doc_id, page_refs, part)
+                if content_hash_val in seen_hashes:
                     continue
-                seen_hashes.add(content_hash)
+                seen_hashes.add(content_hash_val)
                 refs = list({m.group(0) for m in xref_pattern.finditer(part)})
                 chunks.append(
                     LDU(
-                        id=content_hash,
+                        id=content_hash_val,
                         doc_id=doc.doc_id,
                         chunk_type=source_type,
                         content=part,
@@ -171,7 +261,7 @@ class ChunkingEngine:
                         bounding_box=tb.bbox,
                         parent_section=None,
                         token_count=ptokens,
-                        content_hash=content_hash,
+                        content_hash=content_hash_val,
                         references=refs,
                     )
                 )
@@ -190,13 +280,13 @@ class ChunkingEngine:
             tokens = _approx_token_count(content)
             page_refs = [tbl.page_number]
             bbox = tbl.bbox or BoundingBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
-            content_hash = _hash_content(doc.doc_id, page_refs, content)
-            if content_hash in seen_hashes:
+            content_hash_val = content_hash(doc.doc_id, page_refs, content)
+            if content_hash_val in seen_hashes:
                 continue
-            seen_hashes.add(content_hash)
+            seen_hashes.add(content_hash_val)
             chunks.append(
                 LDU(
-                    id=content_hash,
+                    id=content_hash_val,
                     doc_id=doc.doc_id,
                     chunk_type=ChunkType.table,
                     content=content,
@@ -204,7 +294,7 @@ class ChunkingEngine:
                     bounding_box=bbox,
                     parent_section=None,
                     token_count=tokens,
-                    content_hash=content_hash,
+                    content_hash=content_hash_val,
                     references=[],
                 )
             )
@@ -217,13 +307,13 @@ class ChunkingEngine:
             tokens = _approx_token_count(caption)
             page_refs = [fig.page_number]
             bbox = fig.bbox or BoundingBox(x0=0.0, y0=0.0, x1=0.0, y1=0.0)
-            content_hash = _hash_content(doc.doc_id, page_refs, caption)
-            if content_hash in seen_hashes:
+            content_hash_val = content_hash(doc.doc_id, page_refs, caption)
+            if content_hash_val in seen_hashes:
                 continue
-            seen_hashes.add(content_hash)
+            seen_hashes.add(content_hash_val)
             chunks.append(
                 LDU(
-                    id=content_hash,
+                    id=content_hash_val,
                     doc_id=doc.doc_id,
                     chunk_type=ChunkType.figure,
                     content=caption,
@@ -231,10 +321,13 @@ class ChunkingEngine:
                     bounding_box=bbox,
                     parent_section=None,
                     token_count=tokens,
-                    content_hash=content_hash,
+                    content_hash=content_hash_val,
                     references=[],
                 )
             )
+
+        # Resolve cross-references to LDU ids (Table N, Figure N by document order).
+        _resolve_cross_references(chunks)
 
         self.validator.validate(chunks)
         return chunks

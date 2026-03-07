@@ -52,6 +52,7 @@ This repository implements **The Document Intelligence Refinery** – a producti
   - `run_pipeline.py` – programmatic end-to-end pipeline runner.
   - `vector_explorer.py` – CLI explorer for the vector store (LDUs).
   - `chunk_from_extracted.py` – run chunking + ingest from cached extraction only.
+  - `export_markdown.py` – export cached extraction to Markdown.
 
 ### Setup
 
@@ -96,6 +97,27 @@ You will be prompted for:
   - `5) Vector DB` – explore stored chunks (LDUs) via a small CLI explorer (summary, list docs, show doc, search, raw dump).
 
 All modes load configuration from `rubric/extraction_rules.yaml` and update artifacts in `.refinery/`.
+
+### Running the API
+
+The REST API lives in the **doc_refiner_api** folder (sibling to DocRefinery). Run it using DocRefinery’s environment (so the pipeline and its dependencies are available). From the workspace that contains both `DocRefinery` and `doc_refiner_api`:
+
+```bash
+cd DocRefinery
+uv run python ../doc_refiner_api/run_api.py
+```
+
+Then open [http://localhost:8000/docs](http://localhost:8000/docs) for the interactive OpenAPI (Swagger) UI. Endpoints include:
+
+- `GET /health`, `GET /ready` – liveness and readiness
+- `GET /api/documents` – list documents with status
+- `POST /api/documents` – submit a PDF by path (body: `{"path": "data/your.pdf"}`); returns 202 with `doc_id`
+- `GET /api/documents/{doc_id}/status` – document status (pending | processing | ready | failed)
+- `GET /api/documents/{doc_id}/extraction` – cached extraction JSON
+- `GET /api/documents/{doc_id}/markdown` – human-readable Markdown
+- `POST /api/documents/{doc_id}/query` – run a question (body: `{"question": "..."}`); returns answer and provenance
+
+Set `.env` (see below) if the pipeline uses LLM/VLM backends.
 
 ### LLM Configuration via `.env`
 
