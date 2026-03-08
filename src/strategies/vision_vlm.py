@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-import math
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -20,6 +20,8 @@ from src.models import (
     DocumentProfile,
 )
 from .base import ExtractionResult, ExtractionStrategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,8 +61,8 @@ class VisionExtractor(ExtractionStrategy):
         return (tokens / 1000.0) * self.vcfg.cost_per_1k_tokens_usd
 
     def _page_to_png_bytes(self, page) -> bytes:
-        # Rasterize a pdfplumber page to PNG in-memory
-        pil_img = page.to_image(resolution=200).original
+        # 100 DPI keeps base64 under 4MB for Groq; still readable for extraction
+        pil_img = page.to_image(resolution=100).original
         from io import BytesIO
 
         buf = BytesIO()
@@ -72,15 +74,23 @@ class VisionExtractor(ExtractionStrategy):
 
         prompt = (
             "You are a document parsing assistant. Given this page image, "
-            "return a JSON object with fields: text_blocks (array of {text}), "
-            "tables (array of {headers, rows}), and figures (array of {caption}). "
-            "Do not include any explanation text, only JSON."
+            "return a JSON object with fields: "
+            "text_blocks (array of {text}), "
+            "tables (array of {headers, rows}), "
+            "and figures (array of {caption, label?, description?}). "
+            "IMPORTANT: Extract ALL images, charts, diagrams, logos, and figures on the page. "
+            "For each figure: use caption if present in the document; otherwise use description "
+            "to describe what you see (e.g. 'Bar chart of budget by program', 'Logo', 'Pie chart showing allocation'). "
+            "Do not skip figures. Do not include any explanation text, only JSON."
         )
 
         try:
             return call_vision_llm(b64, prompt, self.llm_cfg)
-        except Exception:
-            # In environments without a configured LLM, degrade gracefully.
+        except Exception as e:
+            logger.warning(
+                "Vision VLM call failed: %s. Ensure LLM_VISION_MODEL is vision-capable (e.g. llama3.2-vision).",
+                str(e)[:150],
+            )
             return None
 
     def extract(self, profile: DocumentProfile) -> ExtractionResult:
@@ -102,13 +112,14 @@ class VisionExtractor(ExtractionStrategy):
                 result_json = self._call_vlm(image_bytes)
 
                 if not result_json:
-                    # If no VLM call possible, we degrade gracefully: empty content but low confidence.
+                    # VLM call failed (exception or unavailable); degrade gracefully.
+                    logger.debug("Page %d: VLM returned no result", page_idx)
                     page_confidences[page_idx] = 0.1
                     continue
 
-                # Text blocks
+                # Text blocks (VLM may return dicts {text: "..."} or plain strings)
                 for tb in result_json.get("text_blocks", []):
-                    text = tb.get("text", "")
+                    text = tb.get("text", "") if isinstance(tb, dict) else str(tb or "")
                     if not text:
                         continue
                     # We do not have true coordinates; we store None bbox and rely on content_hash later.
@@ -121,8 +132,10 @@ class VisionExtractor(ExtractionStrategy):
                         )
                     )
 
-                # Tables
+                # Tables (tbl must be dict with headers/rows)
                 for tbl in result_json.get("tables", []):
+                    if not isinstance(tbl, dict):
+                        continue
                     headers = [str(h) for h in tbl.get("headers", [])]
                     rows_data = tbl.get("rows", [])
                     rows: List[List[TableCell]] = []
@@ -149,16 +162,23 @@ class VisionExtractor(ExtractionStrategy):
                         )
                     )
 
-                # Figures
+                # Figures (fig may be dict {caption, label, description} or string)
                 for fig in result_json.get("figures", []):
-                    figures.append(
-                        Figure(
-                            page_number=page_idx,
-                            bbox=None,
-                            caption=fig.get("caption"),
-                            label=fig.get("label"),
+                    if isinstance(fig, dict):
+                        cap = fig.get("caption") or fig.get("description")
+                        lbl = fig.get("label")
+                    else:
+                        cap = str(fig) if fig else None
+                        lbl = None
+                    if cap or lbl:
+                        figures.append(
+                            Figure(
+                                page_number=page_idx,
+                                bbox=None,
+                                caption=str(cap) if cap else None,
+                                label=str(lbl) if lbl else None,
+                            )
                         )
-                    )
 
                 # Confidence: we assume VLM extraction is high quality when it returns anything
                 has_any = bool(
@@ -167,6 +187,11 @@ class VisionExtractor(ExtractionStrategy):
                     or result_json.get("figures")
                 )
                 page_confidences[page_idx] = 0.9 if has_any else 0.2
+                if not has_any:
+                    logger.warning(
+                        "Page %d: VLM returned empty. Check that LLM_VISION_MODEL is vision-capable (e.g. llama3.2-vision, not llama3.2).",
+                        page_idx,
+                    )
 
         extracted = ExtractedDocument(
             doc_id=profile.doc_id,

@@ -216,6 +216,35 @@ class FactTable:
         return [dict(r) for r in rows]
 
 
+def _extract_answer_from_context(
+    question: str, context_chunks: List[str], llm_cfg: LLMConfig
+) -> str:
+    """
+    Use the LLM to produce a direct, concise answer from retrieved document chunks.
+    E.g. for 'What is the country code of Ethiopia?' and context containing
+    'Country code: +251', returns '+251' (or a short phrase) instead of the raw chunk.
+    """
+    if not context_chunks:
+        return "No relevant information found."
+    context = "\n\n---\n\n".join(c[:2000] for c in context_chunks[:5])
+    prompt = (
+        "Use ONLY the following excerpts from a document to answer the question. "
+        "Give a direct, concise answer: the exact value or short phrase from the text "
+        "(e.g. if the text says 'Country code: +251', answer with '+251'). "
+        "Do not repeat the question or add extra explanation. "
+        "If the excerpts do not contain the answer, say 'No relevant information found.'\n\n"
+        f"Question: {question}\n\n"
+        "Excerpts:\n"
+        f"{context}\n\n"
+        "Answer:"
+    )
+    try:
+        raw = call_text_llm(prompt, llm_cfg).strip()
+        return raw if raw else context_chunks[0][:500]
+    except Exception:
+        return context_chunks[0][:500]
+
+
 def _span_from_ldu(ldu: LDU, doc_name: str) -> ProvenanceSpan:
     """Build a ProvenanceSpan from an LDU; sets page_end when LDU spans multiple pages."""
     page_number = ldu.page_refs[0] if ldu.page_refs else 1
@@ -281,19 +310,26 @@ class QueryAgent:
 
     def answer(self, question: str, doc_name: str) -> tuple[str, ProvenanceChain]:
         """
-        Very simple answering strategy:
-        - Use semantic_search over LDUs.
-        - Take the top match's content as the answer.
-        - Build a ProvenanceChain from the LDU metadata.
+        Answer using semantic search over LDUs, then (when LLM is available)
+        extract a direct, concise answer from the retrieved context so that
+        e.g. "What is the country code of Ethiopia?" yields "+251" from text
+        like "Country code: +251".
         """
-        matches = self.semantic_search(question, k=1)
+        matches = self.semantic_search(question, k=5)
         if not matches:
             return "No relevant information found.", ProvenanceChain(spans=[])
 
         best = matches[0]
         span = _span_from_ldu(best, doc_name)
         chain = ProvenanceChain(spans=[span])
-        return best.content, chain
+        try:
+            llm_cfg = LLMConfig.from_env()
+            answer_text = _extract_answer_from_context(
+                question, [m.content for m in matches], llm_cfg
+            )
+            return answer_text, chain
+        except Exception:
+            return best.content, chain
 
     # --- audit mode ---
 
@@ -459,10 +495,15 @@ def build_langgraph_agent(agent: QueryAgent):
                 state["fallback_used"] = False
                 return state
         else:
-            matches = agent.semantic_search(question, k=1)
+            matches = agent.semantic_search(question, k=5)
             if matches:
                 best = matches[0]
-                state["answer"] = best.content
+                try:
+                    state["answer"] = _extract_answer_from_context(
+                        question, [m.content for m in matches], llm_cfg
+                    )
+                except Exception:
+                    state["answer"] = best.content
                 state["provenance"] = ProvenanceChain(spans=[_span_from_ldu(best, doc_name)])
                 state["tool_used"] = "semantic_search"
                 state["fallback_used"] = False
@@ -478,10 +519,15 @@ def build_langgraph_agent(agent: QueryAgent):
                 state["fallback_used"] = True
                 return state
         if chosen != "semantic_search":
-            matches = agent.semantic_search(question, k=1)
+            matches = agent.semantic_search(question, k=5)
             if matches:
                 best = matches[0]
-                state["answer"] = best.content
+                try:
+                    state["answer"] = _extract_answer_from_context(
+                        question, [m.content for m in matches], llm_cfg
+                    )
+                except Exception:
+                    state["answer"] = best.content
                 state["provenance"] = ProvenanceChain(spans=[_span_from_ldu(best, doc_name)])
                 state["tool_used"] = "semantic_search"
                 state["fallback_used"] = True
